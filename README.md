@@ -7,6 +7,21 @@
 
 配套的脚本与配置生成器在 [vpn-toolkit](https://github.com/hanhan9999999999999999999/vpn-toolkit)。
 
+## 声明
+
+本插件是**本地进程管理与界面接入的技术示例，仅供学习与研究使用**。
+
+- 不提供、不内置、也不推荐任何节点、订阅源或可用服务；
+- 不含代理内核，内核与订阅由使用者自行获取；
+- 请遵守所在国家或地区的法律法规，使用后果由使用者自行承担。
+
+## Notice
+
+A technical example of local process management and host-UI integration, provided
+**for study and research only**. No nodes, subscriptions, services or proxy core
+are bundled or endorsed. You are responsible for how you use it and for the laws
+that apply to you.
+
 ## 装
 
 ```sh
