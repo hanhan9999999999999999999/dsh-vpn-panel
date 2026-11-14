@@ -25,12 +25,10 @@ that apply to you.
 ## 装
 
 ```sh
-# 从 npm（发布后）
-dsh plugin --profile desktop add dsh-vpn-panel
-
-# 或者直接从仓库
 dsh plugin --profile desktop add https://github.com/hanhan9999999999999999999/dsh-vpn-panel
 ```
+
+只从仓库装。同名 npm 包已由作者撤回（撤回前已发布的版本带 deprecate 警告），不要用 `npm i dsh-vpn-panel`。
 
 装完重启 DSH，**设置 → VPN** 就在左侧栏目里。
 
