@@ -24,7 +24,7 @@ import os from 'node:os'
 import path from 'node:path'
 import net from 'node:net'
 import http from 'node:http'
-import { spawn } from 'node:child_process'
+import { spawn, spawnSync } from 'node:child_process'
 
 export const name = 'vpn-panel'
 export const inject = ['webServer']
@@ -36,7 +36,9 @@ const DEFAULTS = {
   scriptsDir: 'D:\\document\\vpn',
   proxyPort: 7891,
   controllerPort: 9090,
-  autoStart: false,
+  // Opens the VPN when DSH starts and closes it when DSH exits. This is not an
+  // OS autostart: nothing is registered to run at boot.
+  autoStart: true,
   testUrl: 'http://speed.cloudflare.com/__down?bytes=5000000',
 }
 
@@ -243,6 +245,74 @@ const state = {
   lastActionAt: 0,
 }
 
+/* ── lifetime: leave nothing behind when DSH goes away ──────────────────
+ *
+ * vpn-on.ps1 starts mihomo with Start-Process (a detached, reparented process)
+ * and writes two persistent values into the user's registry:
+ *
+ *   ProxyEnable = 1                 ← survives every reboot
+ *   ProxyServer = 127.0.0.1:7891    ← survives every reboot
+ *
+ * Killing mihomo does not clear them. After a shutdown or a crashed DSH the
+ * machine boots with the system proxy still pointed at a port nothing listens
+ * on, and every app that honours the system proxy has no network — which looks
+ * exactly like "the internet is broken", not like "a VPN was left running".
+ * So the panel has to undo them itself, both on a clean exit and on the next
+ * start (in case the previous exit never ran).
+ */
+
+const PROXY_REG = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings'
+
+function regRunSync(args) {
+  try {
+    const res = spawnSync('reg.exe', args, { windowsHide: true, timeout: 3000, encoding: 'utf8' })
+    return { ok: res.status === 0, out: String(res.stdout || '') }
+  } catch {
+    return { ok: false, out: '' }
+  }
+}
+
+/** ProxyEnable on the current user. Reads the live registry, not a cached copy. */
+function systemProxyEnabledSync() {
+  const { out } = regRunSync(['query', PROXY_REG, '/v', 'ProxyEnable'])
+  return /\b0x1\b|\b1\b/.test(out.split('ProxyEnable').pop() || '')
+}
+
+function systemProxyServerSync() {
+  const { out } = regRunSync(['query', PROXY_REG, '/v', 'ProxyServer'])
+  const tail = out.split('ProxyServer').pop() || ''
+  const m = /REG_SZ\s+(\S+)/.exec(tail)
+  return m ? m[1].trim() : ''
+}
+
+/**
+ * Point the system proxy back at "off", synchronously.
+ * Must be synchronous: on exit this is the last code that runs, and an async
+ * child never gets to finish. Registry writes take single-digit milliseconds.
+ */
+function restoreProxySync() {
+  regRunSync(['add', PROXY_REG, '/v', 'ProxyEnable', '/t', 'REG_DWORD', '/d', '0', '/f'])
+  for (const value of ['ProxyServer', 'ProxyOverride', 'AutoConfigURL']) {
+    regRunSync(['delete', PROXY_REG, '/v', value, '/f'])
+  }
+}
+
+/** Only undo the proxy if it is *this* panel's proxy — never a user's own. */
+function restoreProxyIfOursSync(conf) {
+  const server = systemProxyServerSync()
+  const ours = server === `127.0.0.1:${conf.proxyPort}` || server.endsWith(`:${conf.proxyPort}`)
+  if (!ours) return false
+  restoreProxySync()
+  return true
+}
+
+function killCoreSync() {
+  try {
+    spawnSync('taskkill', ['/F', '/T', '/IM', 'mihomo.exe'], { windowsHide: true, timeout: 5000 })
+  } catch {}
+}
+
+
 function runPowerShell(scriptPath, args = [], timeoutMs = 60000) {
   return new Promise((resolve) => {
     const exists = (() => {
@@ -429,6 +499,50 @@ function speedThroughProxy(conf, url) {
 export function apply(ctx) {
   const disposers = []
   let conf = readSettings()
+  let startupTimer = null
+  let shutDown = false
+
+  /**
+   * Tear the VPN down on the way out: kill the core, then put the system proxy
+   * back. Registry first would leave a window where apps still point at a dying
+   * port; killing first means "not listening" is already true when the proxy
+   * settings change, which is the state apps recover from cleanly.
+   */
+  const stopVpnForExit = () => {
+    if (shutDown) return
+    shutDown = true
+    state.busy = null
+    killCoreSync()
+    restoreProxyIfOursSync(conf)
+    // Flush the WinINet connection cache so already-running apps drop the dead
+    // proxy immediately instead of after a reconnect timeout.
+    //
+    // This must be synchronous, and must NOT be detached. A detached Windows
+    // child starts without a console; PowerShell in that state exits 0 and
+    // never executes -File (verified side by side: identical arguments
+    // non-detached write the log, detached leave it empty). Synchronous is also
+    // the only safe form inside process.on('exit'). Bounded so a wedged script
+    // cannot hold the shutdown open.
+    try {
+      const offScript = path.join(conf.scriptsDir, 'vpn-off.ps1')
+      if (fs.existsSync(offScript)) {
+        spawnSync(
+          'powershell.exe',
+          ['-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', offScript],
+          { timeout: 10000, windowsHide: true, stdio: 'ignore' },
+        )
+      }
+    } catch {}
+  }
+
+  // Backstop for exits that skip module disposal (window closed, process
+  // terminated). process.on('exit') can still run spawnSync, which is why the
+  // registry repair above is synchronous.
+  try {
+    process.on('exit', stopVpnForExit)
+    for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, stopVpnForExit)
+  } catch {}
+
 
   const route = (apiPath, method, handler) =>
     disposers.push(
@@ -591,14 +705,17 @@ export function apply(ctx) {
     const saved = writeSettings(body || {})
     if (!saved.ok) return { ok: false, error: saved.error, httpStatus: 400 }
     conf = readSettings()
-    // Autostart rides the per-user Run key, the same way the desktop shortcut does.
+    // `autoStart` means "open the VPN when DSH starts", NOT "start with Windows".
+    // The old build wrote a Run-key entry for it, which brought the proxy up on
+    // boot while DSH was closed — the one state that leaves a machine offline.
+    // Anything left by that build is removed here.
     if (body && typeof body.autoStart === 'boolean') {
-      const runKey = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run'
-      const command = `powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "${path.join(conf.scriptsDir, 'vpn-on.ps1')}"`
       await new Promise((resolve) => {
-        const child = body.autoStart
-          ? spawn('reg.exe', ['add', runKey, '/v', 'DSHVpn', '/t', 'REG_SZ', '/d', command, '/f'], { windowsHide: true })
-          : spawn('reg.exe', ['delete', runKey, '/v', 'DSHVpn', '/f'], { windowsHide: true })
+        const child = spawn(
+          'reg.exe',
+          ['delete', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'DSHVpn', '/f'],
+          { windowsHide: true },
+        )
         child.on('close', () => resolve())
         child.on('error', () => resolve())
       })
@@ -613,7 +730,56 @@ export function apply(ctx) {
       } catch {}
     }
     disposers.length = 0
+    if (startupTimer) clearTimeout(startupTimer)
+    try {
+      process.removeListener('exit', stopVpnForExit)
+      for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.removeListener(signal, stopVpnForExit)
+    } catch {}
+    stopVpnForExit()
   }
   if (typeof ctx.effect === 'function') ctx.effect(() => disposeAll)
   else if (typeof ctx.on === 'function') ctx.on('dispose', disposeAll)
+
+  /* ── open with DSH, not with the machine ────────────────────────────────
+   *
+   * There is deliberately no Run-key entry: booting the PC must not resurrect
+   * the VPN while DSH is not running. The lifetime is DSH's own — the proxy
+   * opens shortly after the panel loads and is closed again on dispose.
+   *
+   * Before opening, the previous exit is checked: if the system proxy still
+   * points at our port while nothing is listening (a hard shutdown, a crash, a
+   * killed process), it is repaired first, so a bad shutdown cannot leave the
+   * machine without network.
+   */
+  startupTimer = setTimeout(async () => {
+    startupTimer = null
+    try {
+      const listening = await portOpen(conf.proxyPort)
+      if (!listening) {
+        if (restoreProxyIfOursSync(conf)) {
+          state.lastLog = `清理了上次残留的系统代理（指向 127.0.0.1:${conf.proxyPort}，端口无人监听）`
+        }
+      }
+      if (!conf.autoStart) return
+      if (listening) {
+        state.lastLog = `VPN 已在 127.0.0.1:${conf.proxyPort} 上运行，接管现有实例`
+        return
+      }
+      state.busy = 'on'
+      state.lastError = ''
+      state.lastActionAt = Date.now()
+      const res = await runPowerShell(
+        path.join(conf.scriptsDir, 'vpn-on.ps1'),
+        ['-Port', String(conf.proxyPort)],
+        120000,
+      )
+      state.lastLog = (res.out || '') + (res.err ? '\n[stderr]\n' + res.err : '')
+      if (!res.ok) state.lastError = (res.err || res.out || `exit ${res.code}`).slice(-2000)
+    } catch (err) {
+      state.lastError = String((err && err.message) || err)
+    } finally {
+      state.busy = null
+    }
+  }, 1500)
+  if (startupTimer && typeof startupTimer.unref === 'function') startupTimer.unref()
 }
