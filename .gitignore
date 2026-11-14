@@ -6,3 +6,20 @@ node_modules/
 .idea/
 Thumbs.db
 desktop.ini
+
+# runtime state
+assets/vpn/data/cache.db
+test/.tmp-AGENTS.md*
+
+# node-bearing files stay local: subscriptions, generated config, cache
+assets/vpn/data/config.yaml
+assets/vpn/subs/*.txt
+!assets/vpn/subs/.gitkeep
+
+# the core binary and geo data are not distributed here: fetch mihomo from its
+# own release and drop it in place locally
+assets/vpn/bin/mihomo.exe
+assets/vpn/bin/*.exe
+assets/vpn/data/*.mmdb
+assets/vpn/data/geosite.dat
+assets/vpn/data/geoip.dat

@@ -1,0 +1,44 @@
+# config.example.yaml
+#
+# Skeleton only — no nodes. Copy it to config.yaml and fill in `proxies`
+# (or run vpn-refresh.ps1, which builds this file from ../subs/*.txt).
+#
+# The panel's bundled runtime looks for config.yaml in this same directory.
+# Keep your real config.yaml out of git: it carries your nodes.
+
+mixed-port: 7891
+allow-lan: false
+bind-address: "127.0.0.1"
+mode: "rule"
+log-level: "warning"
+ipv6: false
+external-controller: "127.0.0.1:9090"
+unified-delay: true
+tcp-concurrent: true
+geodata-mode: false
+geo-auto-update: false
+profile:
+  store-selected: true
+  store-fake-ip: false
+
+# One entry per node. `type` is a mihomo/Clash.Meta proxy type
+# (vmess, vless, trojan, ss, hysteria2, tuic ...). See mihomo's docs
+# for the fields each type needs.
+proxies: []
+
+proxy-groups:
+  - name: "手动切换"
+    type: select
+    proxies:
+      - "自动选择"
+      - DIRECT
+  - name: "自动选择"
+    type: url-test
+    url: "http://www.gstatic.com/generate_204"
+    interval: 300
+    tolerance: 50
+    proxies:
+      - DIRECT
+
+rules:
+  - MATCH,手动切换

@@ -1,7 +1,7 @@
-﻿{
+{
     "name":  "dsh-vpn-panel",
-    "version":  "0.1.0",
-    "description":  "DSH Settings section that controls a local proxy core: start/stop, node selection, real download measurement and config rebuild. Ships no nodes or proxy core.",
+    "version":  "0.2.0",
+    "description":  "DSH Settings section that controls a local proxy core: start/stop, node selection, real download measurement and config rebuild. Also teaches every agent session to reach the internet through that proxy (vpn_proxy tool + /dsh-vpn/ensure.json + an injected rule block), instead of hand-rolling proxy URLs. Bundles its own mihomo core, lifecycle scripts and a watchdog so it works standalone.",
     "type":  "module",
     "main":  "src/index.js",
     "exports":  {
@@ -14,7 +14,8 @@
                   "src",
                   "lib",
                   "cordis.patch.yml",
-                  "README.md"
+                  "README.md",
+                  "assets"
               ],
     "dsh":  {
                 "bundle":  {
@@ -33,8 +34,20 @@
                      "deepseek-harness",
                      "vpn",
                      "proxy",
-                     "mihomo"
+                     "mihomo",
+                     "agent"
                  ],
+    "scripts":  {
+                    "test":  "node test/host-harness.mjs ./src/index.js 51997 && node test/agent-api.mjs 51996"
+                },
+    "peerDependencies":  {
+                             "@deepseek-ai/dsh-tools":  "*"
+                         },
+    "peerDependenciesMeta":  {
+                                 "@deepseek-ai/dsh-tools":  {
+                                                                "optional":  true
+                                                            }
+                             },
     "engines":  {
                     "node":  "^22.19.0 || \u003e=24.0.0"
                 },

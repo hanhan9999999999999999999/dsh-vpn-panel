@@ -25,12 +25,54 @@ import path from 'node:path'
 import net from 'node:net'
 import http from 'node:http'
 import { spawn, spawnSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { proxyInfo, NO_PROXY } from './proxy-info.js'
+import { upsertAgentsRule, defaultAgentsFile } from './instructions.js'
+import { loadDefineTool, makeVpnProxyHandler, vpnProxySpec, TOOL_NAME } from './tool.js'
 
 export const name = 'vpn-panel'
 export const inject = ['webServer']
 
 const DSH_HOME = process.env.DSH_HOME || path.join(os.homedir(), '.dsh')
 const SETTINGS_FILE = path.join(DSH_HOME, 'vpn-panel.json')
+
+/**
+ * Machine-readable hand-off for sessions that have no tool call available:
+ * `{ proxy, port, running, panelUrl, ... }`, refreshed on every start, ensure,
+ * power toggle and settings save. Reading a file beats guessing a port.
+ */
+const AGENT_STATE_FILE = path.join(DSH_HOME, 'vpn-panel-agent.json')
+
+/* The runtime that ships inside this package: bin\mihomo.exe, data\{config.yaml,
+ * Country.mmdb, geosite.dat}, vpn-on/off/refresh.ps1 and a watchdog script.
+ * A fresh install therefore works with no hand-made D:\document\vpn at all —
+ * that directory is only used when the user points settings at it. */
+const BUNDLED_SCRIPTS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'assets', 'vpn')
+
+function hasEntryScript(dir) {
+  try {
+    return !!dir && fs.existsSync(path.join(dir, 'vpn-on.ps1'))
+  } catch {
+    return false
+  }
+}
+
+/** Prefer the configured directory; fall back to the bundled runtime. */
+function hasWatchdogScript(dir) {
+  try {
+    return !!dir && fs.existsSync(path.join(dir, 'watchdog.ps1'))
+  } catch {
+    return false
+  }
+}
+
+// A configured directory only wins when it holds the full set (entry script AND watchdog);
+// an older external copy that predates -WatchPid would reject the argument and break start.
+function resolveScriptsDir(dir) {
+  if (hasEntryScript(dir) && hasWatchdogScript(dir)) return dir
+  if (hasEntryScript(BUNDLED_SCRIPTS_DIR)) return BUNDLED_SCRIPTS_DIR
+  return dir || BUNDLED_SCRIPTS_DIR
+}
 
 const DEFAULTS = {
   scriptsDir: 'D:\\document\\vpn',
@@ -40,15 +82,21 @@ const DEFAULTS = {
   // OS autostart: nothing is registered to run at boot.
   autoStart: true,
   testUrl: 'http://speed.cloudflare.com/__down?bytes=5000000',
+  // Write the "use this proxy" rule into ~/.agents/AGENTS.md so later sessions
+  // know the panel exists. The rule sits between markers and is refreshed in
+  // place; set false to keep the file untouched.
+  injectAgentRule: true,
 }
 
 function readSettings() {
+  let merged
   try {
     const raw = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'))
-    return { ...DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) }
+    merged = { ...DEFAULTS, ...(raw && typeof raw === 'object' ? raw : {}) }
   } catch {
-    return { ...DEFAULTS }
+    merged = { ...DEFAULTS }
   }
+  return { ...merged, scriptsDir: resolveScriptsDir(merged.scriptsDir) }
 }
 
 function coercePort(value, fallback, label) {
@@ -73,6 +121,7 @@ function writeSettings(patch) {
       controllerPort: coercePort(next.controllerPort, DEFAULTS.controllerPort, 'controllerPort'),
       autoStart: next.autoStart === true,
       testUrl: String(next.testUrl || DEFAULTS.testUrl),
+      injectAgentRule: next.injectAgentRule !== false,
     }
   } catch (err) {
     return { ok: false, error: String((err && err.message) || err) }
@@ -501,6 +550,88 @@ export function apply(ctx) {
   let conf = readSettings()
   let startupTimer = null
   let shutDown = false
+  let ensureInFlight = null
+
+  /** The panel URL, when the host exposes its port; null otherwise. */
+  const panelBaseUrl = () => {
+    try {
+      const port = ctx.webServer && (ctx.webServer.port || (ctx.webServer.server && ctx.webServer.server.address && ctx.webServer.server.address().port))
+      return port ? `http://127.0.0.1:${port}` : null
+    } catch {
+      return null
+    }
+  }
+
+  /**
+   * Refresh everything a *session* reads: the state file (for shells and
+   * sessions without the tool) and the AGENTS.md rule (for sessions that have
+   * not been told about the panel yet). Cheap, so it runs on every state change.
+   */
+  const publishAgentSurface = async (info0) => {
+    try {
+      const st = info0 ? null : await collectStatus(conf)
+      const info = info0 || proxyInfo(conf, st)
+      info.panelUrl = panelBaseUrl()
+      try {
+        fs.mkdirSync(path.dirname(AGENT_STATE_FILE), { recursive: true })
+        fs.writeFileSync(AGENT_STATE_FILE, JSON.stringify({ plugin: 'dsh-vpn-panel', ...info }, null, 2), 'utf8')
+      } catch (err) {
+        state.lastError = 'write agent state: ' + String((err && err.message) || err)
+      }
+      if (conf.injectAgentRule === false) return
+      const res = upsertAgentsRule({
+        file: defaultAgentsFile(),
+        info,
+        log: (m) => {
+          state.lastLog = (state.lastLog + '\n' + m).slice(-8000)
+        },
+      })
+      if (!res.ok && res.reason) state.lastError = 'AGENTS rule: ' + res.reason
+    } catch (err) {
+      state.lastError = 'publish agent surface: ' + String((err && err.message) || err)
+    }
+  }
+
+  /**
+   * Bring the core up if it is down. Idempotent and shared: five sessions calling
+   * `ensure` at once must produce one `vpn-on.ps1`, not five racing instances.
+   */
+  const ensureCore = async () => {
+    const st0 = await collectStatus(conf)
+    const info0 = proxyInfo(conf, st0)
+    if (info0.running) return { ok: true, started: false, info: info0, log: state.lastLog.slice(-2000) }
+    if (ensureInFlight) return ensureInFlight
+    if (state.busy && state.busy !== 'ensure') {
+      return { ok: false, started: false, info: info0, log: `busy: ${state.busy}` }
+    }
+    ensureInFlight = (async () => {
+      state.busy = 'ensure'
+      state.lastError = ''
+      state.lastActionAt = Date.now()
+      try {
+        const res = await runPowerShell(
+          path.join(conf.scriptsDir, 'vpn-on.ps1'),
+          ['-Port', String(conf.proxyPort), '-WatchPid', String(process.pid)],
+          120000,
+        )
+        state.lastLog = (res.out || '') + (res.err ? '\n[stderr]\n' + res.err : '')
+        if (!res.ok) state.lastError = (res.err || res.out || `exit ${res.code}`).slice(-2000)
+      } catch (err) {
+        state.lastError = String((err && err.message) || err)
+      } finally {
+        state.busy = null
+      }
+      const st = await collectStatus(conf)
+      const info = proxyInfo(conf, st)
+      void publishAgentSurface(info)
+      return { ok: info.running, started: true, info, log: state.lastLog.slice(-3000) }
+    })()
+    try {
+      return await ensureInFlight
+    } finally {
+      ensureInFlight = null
+    }
+  }
 
   /**
    * Tear the VPN down on the way out: kill the core, then put the system proxy
@@ -576,6 +707,43 @@ export function apply(ctx) {
 
   route('/dsh-vpn/status.json', 'GET', async () => collectStatus(conf))
 
+  /**
+   * The two routes a session is told to use. `agent.json` never touches the
+   * core (safe to poll from a status loop); `ensure.json` may start it, which is
+   * exactly the "if the VPN is off, turn it on yourself" behaviour.
+   */
+  route('/dsh-vpn/agent.json', 'GET', async () => {
+    const st = await collectStatus(conf)
+    const info = proxyInfo(conf, st)
+    info.panelUrl = panelBaseUrl()
+    return info
+  })
+
+  route('/dsh-vpn/ensure.json', 'POST', async () => {
+    const out = await ensureCore()
+    return {
+      ok: out.ok,
+      started: out.started,
+      ...out.info,
+      log: out.log,
+    }
+  })
+
+  /**
+   * Last surface the plugin published to disk. Read-only mirror of
+   * `$DSH_HOME/vpn-panel-agent.json`, for a session that would rather ask this
+   * port than resolve the DSH home directory itself.
+   */
+  route('/dsh-vpn/agent-state.json', 'GET', async () => {
+    try {
+      const raw = fs.readFileSync(AGENT_STATE_FILE, 'utf8')
+      return { ok: true, file: AGENT_STATE_FILE, state: JSON.parse(raw) }
+    } catch (err) {
+      return { ok: false, file: AGENT_STATE_FILE, error: String((err && err.message) || err) }
+    }
+  })
+
+
   route('/dsh-vpn/power.json', 'POST', async (req, body) => {
     const on = body && body.on === true
     if (state.busy) return { ok: false, error: `busy: ${state.busy}`, status: await collectStatus(conf) }
@@ -583,11 +751,15 @@ export function apply(ctx) {
     state.lastError = ''
     try {
       const script = path.join(conf.scriptsDir, on ? 'vpn-on.ps1' : 'vpn-off.ps1')
-      const res = await runPowerShell(script, [], 90000)
+      // -WatchPid lets vpn-on.ps1 arm a watchdog that restores the system proxy
+      // even when DSH is killed outright and no exit handler ever runs.
+      const scriptArgs = on ? ['-Port', String(conf.proxyPort), '-WatchPid', String(process.pid)] : []
+      const res = await runPowerShell(script, scriptArgs, 90000)
       state.lastLog = (res.out || '') + (res.err ? '\n[stderr]\n' + res.err : '')
       state.lastActionAt = Date.now()
       if (!res.ok) state.lastError = (res.err || res.out || `exit ${res.code}`).slice(-2000)
       const status = await collectStatus(conf)
+      void publishAgentSurface(proxyInfo(conf, status))
       return { ok: res.ok, action: on ? 'on' : 'off', status, log: state.lastLog.slice(-3000) }
     } finally {
       state.busy = null
@@ -723,6 +895,78 @@ export function apply(ctx) {
     return { ok: true, settings: conf, status: await collectStatus(conf) }
   })
 
+  /* ── hand the proxy to the model ───────────────────────────────────────────
+   *
+   * `tools` is optional: a host without it still gets the HTTP routes and the
+   * AGENTS.md rule, so it is requested through ctx.inject rather than declared
+   * in the plugin's own inject list (a hard dependency would take the whole
+   * panel down on such a host).
+   */
+  const registerTool = async (toolsService) => {
+    if (!toolsService || typeof toolsService.register !== 'function') return
+    const defineTool = await loadDefineTool()
+    const handler = makeVpnProxyHandler({
+      ensure: ensureCore,
+      status: () => collectStatus(conf),
+      power: async (on) => {
+        const st = await collectStatus(conf)
+        if (on === false) {
+          if (state.busy) return { ok: false, message: `busy: ${state.busy}`, info: proxyInfo(conf, st) }
+          state.busy = 'off'
+          try {
+            const res = await runPowerShell(path.join(conf.scriptsDir, 'vpn-off.ps1'), [], 60000)
+            state.lastLog = (res.out || '') + (res.err ? '\n[stderr]\n' + res.err : '')
+            if (!res.ok) state.lastError = (res.err || res.out || `exit ${res.code}`).slice(-2000)
+          } finally {
+            state.busy = null
+          }
+          const after = await collectStatus(conf)
+          void publishAgentSurface(proxyInfo(conf, after))
+          return { ok: !after.running, message: state.lastError, info: proxyInfo(conf, after) }
+        }
+        const out = await ensureCore()
+        return { ok: out.ok, message: out.log, info: out.info }
+      },
+      describe: (st) => proxyInfo(conf, st || {}),
+    })
+    const dispose = toolsService.register(
+      defineTool({
+        ...vpnProxySpec(),
+        execute: (args) => handler(args || {}),
+      }),
+    )
+    if (typeof dispose === 'function') disposers.push(dispose)
+    state.lastLog = (state.lastLog + `\n已注册工具 ${TOOL_NAME}`).slice(-8000)
+  }
+
+  const toolBoot = async () => {
+    try {
+      if (typeof ctx.inject === 'function') {
+        await new Promise((resolve) => {
+          try {
+            const maybe = ctx.inject(['tools'], (scoped) => {
+              registerTool(scoped && scoped.tools).then(resolve).catch((err) => {
+                state.lastError = 'tool register: ' + String((err && err.message) || err)
+                resolve()
+              })
+            })
+            if (maybe && typeof maybe.then === 'function') maybe.then(resolve, resolve)
+            // ctx.inject on a service that never appears just never calls back;
+            // the timer below keeps apply() from waiting on it forever.
+            setTimeout(resolve, 3000).unref?.()
+          } catch {
+            resolve()
+          }
+        })
+      } else if (ctx.tools) {
+        await registerTool(ctx.tools)
+      }
+    } catch (err) {
+      state.lastError = 'tool boot: ' + String((err && err.message) || err)
+    }
+  }
+  void toolBoot()
+
   const disposeAll = () => {
     for (const dispose of disposers) {
       try {
@@ -760,9 +1004,15 @@ export function apply(ctx) {
           state.lastLog = `清理了上次残留的系统代理（指向 127.0.0.1:${conf.proxyPort}，端口无人监听）`
         }
       }
-      if (!conf.autoStart) return
+      if (!conf.autoStart) {
+        // Still publish: a session must learn the port and that the proxy is
+        // down, instead of assuming the machine has no VPN at all.
+        await publishAgentSurface()
+        return
+      }
       if (listening) {
         state.lastLog = `VPN 已在 127.0.0.1:${conf.proxyPort} 上运行，接管现有实例`
+        await publishAgentSurface()
         return
       }
       state.busy = 'on'
@@ -770,11 +1020,12 @@ export function apply(ctx) {
       state.lastActionAt = Date.now()
       const res = await runPowerShell(
         path.join(conf.scriptsDir, 'vpn-on.ps1'),
-        ['-Port', String(conf.proxyPort)],
+        ['-Port', String(conf.proxyPort), '-WatchPid', String(process.pid)],
         120000,
       )
       state.lastLog = (res.out || '') + (res.err ? '\n[stderr]\n' + res.err : '')
       if (!res.ok) state.lastError = (res.err || res.out || `exit ${res.code}`).slice(-2000)
+      await publishAgentSurface()
     } catch (err) {
       state.lastError = String((err && err.message) || err)
     } finally {
