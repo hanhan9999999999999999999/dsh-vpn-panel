@@ -49,15 +49,31 @@ function readSettings() {
   }
 }
 
+function coercePort(value, fallback, label) {
+  if (value === undefined || value === null || value === '') return fallback
+  const n = Number(value)
+  // A port outside 1..65535 gets persisted, then net/http throws ERR_SOCKET_BAD_PORT
+  // on every later status poll — the panel locks itself out with no way back from the UI.
+  if (!Number.isInteger(n) || n < 1 || n > 65535) {
+    throw new Error(`${label} 必须是 1..65535 的整数（收到 ${JSON.stringify(value)}）`)
+  }
+  return n
+}
+
 function writeSettings(patch) {
   const next = { ...readSettings(), ...(patch || {}) }
   // Only known keys, and only sane types — the file is read on every request.
-  const clean = {
-    scriptsDir: String(next.scriptsDir || DEFAULTS.scriptsDir),
-    proxyPort: Number(next.proxyPort) || DEFAULTS.proxyPort,
-    controllerPort: Number(next.controllerPort) || DEFAULTS.controllerPort,
-    autoStart: next.autoStart === true,
-    testUrl: String(next.testUrl || DEFAULTS.testUrl),
+  let clean
+  try {
+    clean = {
+      scriptsDir: String(next.scriptsDir || DEFAULTS.scriptsDir),
+      proxyPort: coercePort(next.proxyPort, DEFAULTS.proxyPort, 'proxyPort'),
+      controllerPort: coercePort(next.controllerPort, DEFAULTS.controllerPort, 'controllerPort'),
+      autoStart: next.autoStart === true,
+      testUrl: String(next.testUrl || DEFAULTS.testUrl),
+    }
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err) }
   }
   try {
     fs.mkdirSync(path.dirname(SETTINGS_FILE), { recursive: true })
@@ -88,9 +104,14 @@ function requestRejection(req) {
     }
     if (!isLoopbackHostname(host.hostname)) return 403
     const site = String(headers['sec-fetch-site'] || '').toLowerCase()
-    if (site === 'cross-site') return 403
+    // same-site = another port/host under the same registrable domain; the panel
+    // is loopback-only, so anything that is not same-origin is a foreign caller.
+    if (site === 'cross-site' || site === 'same-site') return 403
     const origin = headers.origin
-    if (typeof origin === 'string' && origin && origin !== 'null') {
+    if (typeof origin === 'string' && origin) {
+      // `Origin: null` is what file:// pages and sandboxed iframes send. Treating it
+      // as "no origin header" let any local HTML file drive power/settings.
+      if (origin === 'null') return 403
       try {
         if (new URL(origin).host.toLowerCase() !== host.host.toLowerCase()) return 403
       } catch {
@@ -118,6 +139,8 @@ function sendJson(res, code, body) {
   }
 }
 
+const BODY_TOO_LARGE = Symbol('body-too-large')
+
 function readBody(req, limit = 64 * 1024) {
   return new Promise((resolve) => {
     let size = 0
@@ -125,8 +148,12 @@ function readBody(req, limit = 64 * 1024) {
     req.on('data', (c) => {
       size += c.length
       if (size > limit) {
-        req.destroy()
-        resolve(null)
+        // Drain instead of destroying the socket: a destroyed socket answers with
+        // "socket hang up", so the client shows a network error instead of a status.
+        chunks.length = 0
+        req.removeAllListeners('data')
+        req.resume()
+        resolve(BODY_TOO_LARGE)
         return
       }
       chunks.push(c)
@@ -415,9 +442,16 @@ export function apply(ctx) {
           if (wanted !== method) return sendJson(res, 405, { ok: false, error: 'method not allowed' })
           try {
             const body = method === 'POST' ? await readBody(req) : null
+            if (body === BODY_TOO_LARGE) return sendJson(res, 413, { ok: false, error: 'body too large' })
             if (method === 'POST' && body === null) return sendJson(res, 400, { ok: false, error: 'bad json' })
             const result = await handler(req, body)
-            sendJson(res, result && result.status ? result.status : 200, result && result.body ? result.body : result)
+            // NOTE: several routes carry a payload field literally named `status`
+            // (power/refresh/settings/save). Reading it as the HTTP code made
+            // res.statusCode an object, writeHead() threw, and every one of those
+            // routes answered 500 with an empty body while the action had already
+            // run. Use an explicit numeric field instead.
+            const code = result && Number.isInteger(result.httpStatus) ? result.httpStatus : 200
+            sendJson(res, code, result && result.body ? result.body : result)
           } catch (err) {
             state.lastError = String((err && err.stack) || err)
             sendJson(res, 500, { ok: false, error: String((err && err.message) || err) })
@@ -430,7 +464,7 @@ export function apply(ctx) {
 
   route('/dsh-vpn/power.json', 'POST', async (req, body) => {
     const on = body && body.on === true
-    if (state.busy) return { ok: false, error: `busy: ${state.busy}`, status: collectStatus(conf) }
+    if (state.busy) return { ok: false, error: `busy: ${state.busy}`, status: await collectStatus(conf) }
     state.busy = on ? 'on' : 'off'
     state.lastError = ''
     try {
@@ -494,9 +528,14 @@ export function apply(ctx) {
   route('/dsh-vpn/delay.json', 'GET', async (req) => {
     if (!(await portOpen(conf.proxyPort))) return { ok: false, error: 'proxy not running' }
     const url = new URL(req.url || '/', 'http://127.0.0.1')
-    const wanted = String(url.searchParams.get('names') || '')
-      .split(',')
-      .map((s) => s.trim())
+    // Node names routinely contain commas ("日本 01, 大阪"), so a comma-joined list
+    // splits real nodes in half. Prefer repeated ?name= params; keep `names` for
+    // backward compatibility only.
+    const repeated = url.searchParams.getAll('name').map((s) => s.trim()).filter(Boolean)
+    const wanted = (repeated.length
+      ? repeated
+      : String(url.searchParams.get('names') || '').split(',').map((s) => s.trim())
+    )
       .filter(Boolean)
       .slice(0, 60)
     if (!wanted.length) return { ok: false, error: 'names required' }
@@ -550,7 +589,7 @@ export function apply(ctx) {
   // order-dependent in the host router, so GET /settings.json must stay unique.
   route('/dsh-vpn/settings/save.json', 'POST', async (req, body) => {
     const saved = writeSettings(body || {})
-    if (!saved.ok) return { ok: false, error: saved.error }
+    if (!saved.ok) return { ok: false, error: saved.error, httpStatus: 400 }
     conf = readSettings()
     // Autostart rides the per-user Run key, the same way the desktop shortcut does.
     if (body && typeof body.autoStart === 'boolean') {
